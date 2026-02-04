@@ -1,0 +1,15 @@
+# Génération et manipulation de données
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Dashboard interactif
+streamlit>=1.28.0
+
+# Visualisations
+plotly>=5.17.0
+
+# Modèles prédictifs et statistiques
+scikit-learn>=1.3.0
+statsmodels>=0.14.0
+prophet>=1.1.4
+joblib>=1.3.0
