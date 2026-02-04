@@ -1605,7 +1605,7 @@ with tab2:
             # ========================================================================
             
             # Vérifier si les modèles Prophet existent
-            use_prophet = os.path.exists('prophet_model.pkl')
+            use_prophet = os.path.exists('admissions_prophet_model.pkl')
             use_prophet_beds = os.path.exists('beds_prophet_model.pkl')
             use_prophet_epi = os.path.exists('epi_prophet_model.pkl')
             total_admissions_prophet = None  # Initialisation pour la portée de la variable
@@ -1615,7 +1615,7 @@ with tab2:
             if use_prophet:
                 try:
                     # Charger le modèle Prophet
-                    prophet_model = joblib.load('prophet_model.pkl')
+                    prophet_model = joblib.load('admissions_prophet_model.pkl')
                     st.info("**Prédiction ML** : Utilisation du modèle Prophet pour projeter la tendance normale avant application des scénarios.")
                     
                     # Préparer les données pour Prophet (agrégation horaire)
@@ -1626,7 +1626,9 @@ with tab2:
                             'Nombre_Admissions': 'sum',
                             'Indicateur_Epidemie': 'max',
                             'Indicateur_Canicule': 'max',
-                            'Indicateur_Greve': 'max'
+                            'Indicateur_Greve': 'max',
+                            'gravite': 'mean',
+                            'duree_sejour_estimee': 'mean'
                         }).reset_index()
                         
                         # Créer un DataFrame pour les prédictions futures
