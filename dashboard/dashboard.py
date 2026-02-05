@@ -6,7 +6,7 @@ import plotly.graph_objects as go  # pyright: ignore[reportMissingImports]
 from sklearn.linear_model import LinearRegression  # pyright: ignore[reportMissingImports]
 import joblib  # pyright: ignore[reportMissingImports]
 import os  # pyright: ignore[reportMissingImports]
-from config import SCENARIO_MULTIPLIERS, SERVICES_DISTRIBUTION, TOTAL_LITS, NATIONAL_BENCHMARKS, ALERT_THRESHOLDS, COUT_JOUR_INTERIMAIRE, COUT_HEURE_SUP, COUT_LIT_SUPPLEMENTAIRE
+from config import NATIONAL_BENCHMARKS, ALERT_THRESHOLDS, COUT_JOUR_INTERIMAIRE, COUT_HEURE_SUP, COUT_LIT_SUPPLEMENTAIRE
 
 
 # Configuration de la page
@@ -36,7 +36,7 @@ def load_and_adapt_data():
         df['service'] = df['Service'].map(service_mapping)
         
         # Agrégation par jour et service
-        df_daily = df.groupby(['date', 'service']).agg({
+        agg_dict = {
             'Nombre_Admissions': 'sum',
             'Lits_Occupes': 'first',
             'Lits_Disponibles': 'first',
@@ -47,7 +47,19 @@ def load_and_adapt_data():
             'Type_Evenement': lambda x: x.mode()[0] if len(x.mode()) > 0 else 'Aucun',
             'duree_sejour_estimee': 'mean',
             'EPI_Consommation': 'sum'
-        }).reset_index()
+        }
+        
+        # Ajouter les colonnes optionnelles si elles existent
+        if 'Stock_EPI' in df.columns:
+            agg_dict['Stock_EPI'] = 'first'  # Stock est une valeur globale par jour
+        if 'gravite' in df.columns:
+            agg_dict['gravite'] = 'mean'  # Gravité moyenne par service et par jour
+        if 'Rupture_Stock' in df.columns:
+            agg_dict['Rupture_Stock'] = 'max'  # Rupture si au moins un cas dans le service
+        if 'motif_admission' in df.columns:
+            agg_dict['motif_admission'] = lambda x: x.mode()[0] if len(x.mode()) > 0 else 'Autre'  # Motif le plus fréquent par service et par jour
+        
+        df_daily = df.groupby(['date', 'service']).agg(agg_dict).reset_index()
         
         # Calcul des colonnes pour le dashboard
         df_daily['admissions'] = df_daily['Nombre_Admissions'].astype(int)
@@ -83,19 +95,22 @@ def load_and_adapt_data():
         
         # Lits - Approche hybride : global pour métriques, par service pour recommandations
         df_daily['lits_occ'] = df_daily['Lits_Occupes'].astype(int)
-        df_daily['lits_dispo_global'] = df_daily['Lits_Disponibles'].astype(int)  # Lits globaux (conservés)
+        df_daily['lits_dispo_global'] = df_daily['Lits_Disponibles'].astype(int)  # Lits disponibles (non occupés)
         
-        # CORRECTION : On calcule le total des lits basé sur la somme des services configurés
-        # pour éviter l'incohérence entre Global et Somme des Services
-        # La moyenne des taux n'est pas égale au taux global si les dénominateurs diffèrent
-        total_lits_calcule = sum([s['lits_base'] for s in SERVICES_DISTRIBUTION.values()])
-
-        # Si la config donne un total réaliste, on l'utilise, sinon on garde le total_lits_global du dataset
-        if total_lits_calcule > 0:
-            total_lits_global = total_lits_calcule
+        # CORRECTION : Le total des lits = Lits Occupés + Lits Disponibles
+        # C'est la capacité totale de l'hôpital
+        df_daily['total_lits_global_calc'] = df_daily['lits_occ'] + df_daily['lits_dispo_global']
+        
+        # Si le total est constant dans le dataset, on l'utilise (priorité au dataset)
+        if df_daily['total_lits_global_calc'].nunique() == 1:
+            total_lits_global = int(df_daily['total_lits_global_calc'].iloc[0])
         else:
-            total_lits_global = df_daily['lits_dispo_global'].iloc[0] if df_daily['lits_dispo_global'].nunique() == 1 else TOTAL_LITS
+            # Fallback : calculer depuis les données observées dans le CSV
+            # Si le total n'est pas constant, on utilise la moyenne
+            total_lits_global = int(df_daily['total_lits_global_calc'].mean()) if len(df_daily) > 0 else 1800
         
+        # Stocker total_lits_global dans le DataFrame pour utilisation dans les KPI
+        df_daily['total_lits_global'] = total_lits_global
         # Mapping inverse : service du dataset -> service de config
         service_to_config = {
             'Urgences': 'Urgences',
@@ -107,29 +122,40 @@ def load_and_adapt_data():
             'Réanimation': 'Réanimation'
         }
         
-        # Calculer la somme des lits_base pour les services présents dans le dataset
-        total_lits_base = 0
-        service_lits_base_map = {}
+        # DATA-DRIVEN : Calculer la répartition des lits par service depuis le CSV
+        # Au lieu d'utiliser les valeurs théoriques de config.py, on calcule les capacités réelles
+        # observées dans les données historiques pour chaque service
+        service_capacite_map = {}
+        total_capacite_services = 0
         
         for svc in df_daily['service'].unique():
-            config_svc = service_to_config.get(svc)
-            if config_svc and config_svc in SERVICES_DISTRIBUTION:
-                lits_base = SERVICES_DISTRIBUTION[config_svc]['lits_base']
-                service_lits_base_map[svc] = lits_base
-                total_lits_base += lits_base
+            # Calculer la capacité réelle du service : moyenne des lits occupés + moyenne des lits disponibles
+            df_service = df_daily[df_daily['service'] == svc]
+            moyenne_occupes_svc = df_service['lits_occ'].mean() if len(df_service) > 0 else 0
+            # Pour les lits disponibles, on utilise une estimation basée sur la proportion d'admissions
+            # car le CSV n'a pas de lits_dispo par service, seulement global
+            # On estime que les lits disponibles sont proportionnels aux admissions du service
+            total_admissions_svc = df_service['admissions'].sum()
+            total_admissions_global = df_daily['admissions'].sum()
+            if total_admissions_global > 0:
+                # Proportion des admissions = proportion estimée des lits disponibles
+                proportion_admissions = total_admissions_svc / total_admissions_global
+                # Estimer les lits disponibles du service comme proportion du total global
+                moyenne_libres_svc = df_daily['lits_dispo_global'].mean() * proportion_admissions
             else:
-                # Service non trouvé dans config : estimation basée sur moyenne des autres
-                # ou utilisation d'une valeur par défaut
-                avg_lits_base = sum(SERVICES_DISTRIBUTION[s]['lits_base'] for s in SERVICES_DISTRIBUTION) / len(SERVICES_DISTRIBUTION)
-                service_lits_base_map[svc] = int(avg_lits_base)
-                total_lits_base += service_lits_base_map[svc]
+                moyenne_libres_svc = 0
+            
+            # Capacité réelle du service = lits occupés moyens + lits disponibles estimés
+            capacite_reelle_svc = int(moyenne_occupes_svc + moyenne_libres_svc)
+            service_capacite_map[svc] = max(1, capacite_reelle_svc)  # Minimum 1 lit
+            total_capacite_services += service_capacite_map[svc]
         
-        # Répartition proportionnelle basée sur les lits_base
-        if total_lits_base > 0:
+        # Répartition proportionnelle basée sur les capacités réelles observées
+        if total_capacite_services > 0:
             service_lits_map = {}
-            for svc, lits_base in service_lits_base_map.items():
-                # Proportion des lits_base = proportion des lits globaux
-                proportion = lits_base / total_lits_base
+            for svc, capacite_svc in service_capacite_map.items():
+                # Proportion de la capacité réelle = proportion des lits globaux
+                proportion = capacite_svc / total_capacite_services
                 service_lits_map[svc] = max(1, int(total_lits_global * proportion))  # Minimum 1 lit
             
             # Ajustement pour que la somme soit exactement total_lits_global
@@ -153,6 +179,7 @@ def load_and_adapt_data():
         # Limiter à 1.0 max (100%)
         df_daily['taux_occupation'] = df_daily['taux_occupation'].clip(upper=1.0)
         
+        # Personnel (basé sur lits par service pour recommandations)
         # Calcul basé sur les lits disponibles par service (plus réaliste)
         # Ratio national : 3.5 ETP pour 10 lits = 0.35 ETP par lit
         # Personnel disponible = lits_dispo × ratio_staffing × facteur_ajustement
@@ -228,7 +255,7 @@ def load_and_adapt_data():
             'date', 'service', 'admissions', 'admissions_normales', 'admissions_scenario',
             'urgences', 'urgences_normales', 'urgences_scenario',
             'hospit', 'icu', 'icu_normales', 'icu_scenario',
-            'duree_moy', 'lits_occ', 'lits_dispo', 'lits_dispo_global', 'taux_occupation',
+            'duree_moy', 'lits_occ', 'lits_dispo', 'lits_dispo_global', 'total_lits_global', 'taux_occupation',
             'personnel_requis', 'personnel_disponible',
             'materiel_respirateurs', 'materiel_medicaments', 'materiel_protection',
             'scenario', 'scenario_intensity'
@@ -398,6 +425,105 @@ with tab1:
     st.divider()
     
     
+    # ========================================================================
+    # MONITEUR ÉPIDÉMIOLOGIQUE (Top Pathologies)
+    # ========================================================================
+    if 'motif_admission' in df_filtered.columns:
+        st.divider()
+        st.subheader("Top Pathologies (Motifs d'Admission)")
+        st.caption("Analyse des causes principales d'admission pour comprendre les tensions hospitalières")
+        
+        # Compter les motifs sur toute la période filtrée
+        top_motifs = df_filtered['motif_admission'].value_counts().head(5).reset_index()
+        top_motifs.columns = ['Motif', 'Nombre']
+        
+        # Calculer le pourcentage par rapport au total
+        total_motifs = df_filtered['motif_admission'].count()
+        top_motifs['Pourcentage'] = (top_motifs['Nombre'] / total_motifs * 100).round(1)
+        
+        # Graphique horizontal pour faciliter la lecture
+        fig_motif = px.bar(
+            top_motifs,
+            x='Nombre',
+            y='Motif',
+            orientation='h',
+            title="Les 5 causes principales d'admission sur la période",
+            color='Nombre',
+            color_continuous_scale='Blues',
+            text='Pourcentage',
+            labels={
+                'Nombre': 'Nombre d\'Admissions',
+                'Motif': 'Motif d\'Admission',
+                'Pourcentage': '%'
+            }
+        )
+        
+        # Trier par ordre décroissant (le plus gros en haut)
+        fig_motif.update_layout(
+            yaxis={'categoryorder': 'total ascending'},
+            height=400,
+            showlegend=False
+        )
+        
+        # Ajouter les pourcentages sur les barres
+        fig_motif.update_traces(
+            texttemplate='%{text}%',
+            textposition='outside'
+        )
+        
+        st.plotly_chart(fig_motif, use_container_width=True)
+        
+        # Métriques de synthèse
+        col_motif1, col_motif2 = st.columns(2)
+        
+        with col_motif1:
+            motif_principal = top_motifs.iloc[0]['Motif']
+            nb_motif_principal = top_motifs.iloc[0]['Nombre']
+            pct_motif_principal = top_motifs.iloc[0]['Pourcentage']
+            st.metric(
+                "Motif Principal",
+                motif_principal,
+                delta=f"{pct_motif_principal}% ({nb_motif_principal:,} admissions)",
+                delta_color="off"
+            )
+        
+        with col_motif2:
+            # Calculer la diversité (nombre de motifs uniques)
+            nb_motifs_uniques = df_filtered['motif_admission'].nunique()
+            st.metric(
+                "Diversité des Motifs",
+                f"{nb_motifs_uniques} motifs différents",
+                delta=f"Top 5 = {top_motifs['Pourcentage'].sum():.1f}% du total",
+                delta_color="off"
+            )
+        
+        # Interprétation contextuelle
+        if len(top_motifs) > 0:
+            motif_1 = top_motifs.iloc[0]['Motif']
+            pct_1 = top_motifs.iloc[0]['Pourcentage']
+            
+            # Détecter des motifs épidémiologiques
+            motifs_epidemie = ['Grippe', 'COVID', 'Épidémie', 'Virus', 'Infection']
+            is_epidemie = any(motif.lower() in motif_1.lower() for motif in motifs_epidemie)
+            
+            if is_epidemie and pct_1 > 20:
+                st.warning(
+                    f"**Contexte Épidémiologique** : Le motif principal est **{motif_1}** ({pct_1}% des admissions). "
+                    f"Cela peut expliquer les tensions observées sur les lits et le personnel. "
+                    f"Recommandation : Surveiller l'évolution de cette pathologie et anticiper les pics."
+                )
+            elif 'Trauma' in motif_1 or 'Accident' in motif_1:
+                st.info(
+                    f"**Contexte Traumatologique** : Le motif principal est **{motif_1}** ({pct_1}% des admissions). "
+                    f"Les admissions traumatiques nécessitent souvent des ressources importantes (urgences, réanimation). "
+                    f"Cela peut expliquer les ratios élevés observés dans les autres KPI."
+                )
+            else:
+                st.info(
+                    f"**Analyse** : Le motif principal est **{motif_1}** ({pct_1}% des admissions). "
+                    f"Les 5 motifs principaux représentent {top_motifs['Pourcentage'].sum():.1f}% du total des admissions."
+                )
+    
     # Métriques clés
     with st.container():
         st.header("Analyse des Flux Hospitaliers")
@@ -425,7 +551,6 @@ with tab1:
                     'lits_dispo': 'sum'  # Somme des lits par service (cohérent avec les services)
                 }).reset_index()
                 df_daily_est.rename(columns={'lits_dispo': 'lits_dispo_total'}, inplace=True)
-                
                 # Calcul de la DMS moyenne pondérée par jour
                 def calc_dms_ponderee(group):
                     if group['admissions'].sum() > 0:
@@ -434,14 +559,9 @@ with tab1:
                 
                 dms_by_date = df_filtered.groupby('date').apply(calc_dms_ponderee)
                 df_daily_est['dms_ponderee'] = df_daily_est['date'].map(dms_by_date)
-                
                 # Estimation lits occupés : Application de la Loi de Little
                 # Formule : Stock (Lits) = Flux (Admissions/jour) × Durée (DMS)
-                # Si le résultat dépasse 100%, c'est que le volume d'entrée est trop haut pour la capacité
                 base_lits_occ = (df_daily_est['admissions'] * df_daily_est['dms_ponderee']).round(0)
-                
-                # Ajout d'une variabilité quotidienne importante (±25%) pour plus de réalisme
-                # Cette variabilité simule les fluctuations naturelles (week-ends, urgences, etc.)
                 def get_variability(date_val):
                     np.random.seed(int(date_val.timestamp()) % 10000)
                     return np.random.normal(1.0, 0.25)
@@ -452,11 +572,9 @@ with tab1:
                 
                 # Lits disponibles globaux (déjà calculé comme somme des services)
                 df_daily_est['lits_dispo'] = df_daily_est['lits_dispo_total']
-                
                 # Taux d'occupation par jour (limité à 85% maximum pour plus de réalisme)
                 # Les hôpitaux maintiennent une marge de sécurité et ne restent pas à saturation constante
-                df_daily_est['taux_occ'] = (df_daily_est['lits_occ_estimes'] / df_daily_est['lits_dispo'] * 100).clip(0, 85)
-                
+                df_daily_est['taux_occ'] = (df_daily_est['lits_occ_estimes'] / df_daily_est['lits_dispo'] * 100)
                 # Moyenne des taux quotidiens
                 global_occupation = df_daily_est['taux_occ'].mean() if len(df_daily_est) > 0 else 0
             else:
@@ -490,8 +608,23 @@ with tab1:
                 dominant_scenario = scenario_counts_no_normal.index[0]
                 # Proportion du scénario dans la période
                 scenario_proportion = scenario_counts_no_normal.iloc[0] / len(df_filtered)
-                # fiplicateur de DMS pour ce scénario
-                dms_multiplier = SCENARIO_MULTIPLIERS.get(dominant_scenario, {}).get('dms', 1.0)
+                # DATA-DRIVEN : Calculer le multiplicateur DMS depuis le CSV
+                df_normal_dms = df_filtered[df_filtered['scenario'] == 'normal']
+                df_scenario_dms = df_filtered[df_filtered['scenario'] == dominant_scenario]
+                if len(df_normal_dms) > 0 and len(df_scenario_dms) > 0:
+                    avg_dms_normal = df_normal_dms['duree_moy'].mean() if 'duree_moy' in df_normal_dms.columns else 5.0
+                    avg_dms_scenario = df_scenario_dms['duree_moy'].mean() if 'duree_moy' in df_scenario_dms.columns else avg_dms_normal
+                    dms_multiplier = avg_dms_scenario / avg_dms_normal if avg_dms_normal > 0 else 1.0
+                else:
+                    # Fallback : valeur par défaut hardcodée si pas de données dans le CSV
+                    default_dms_multipliers = {
+                        'normal': 1.0,
+                        'epidemie': 2.0,
+                        'canicule': 1.1,
+                        'greve': 1.0,
+                        'accident': 1.5
+                    }
+                    dms_multiplier = default_dms_multipliers.get(dominant_scenario, 1.0)
                 # Ajustement pondéré : DMS normale + impact du scénario
                 dms_ajustee = dms_ponderee * (1.0 + (dms_multiplier - 1.0) * scenario_proportion)
             else:
@@ -507,14 +640,15 @@ with tab1:
     # ========================================================================
     # Calcul du taux d'occupation pour la synthèse (si pas déjà calculé)
     if len(df_filtered) > 0:
-        if 'lits_dispo_global' in df_filtered.columns:
-            # Calcul du taux d'occupation moyen pour la synthèse
-            # CORRECTION : Utiliser la somme réelle des lits_dispo des services
+        # CORRECTION : Utiliser total_lits_global (capacité totale depuis le dataset) pour cohérence
+        if 'total_lits_global' in df_filtered.columns:
+            # Utiliser total_lits_global qui est constant (même valeur pour toutes les lignes)
+            # Fallback : valeur par défaut hardcodée si pas de données
+            total_lits_synth = df_filtered['total_lits_global'].iloc[0] if len(df_filtered) > 0 else 1800
+            
             df_daily_synth = df_filtered.groupby('date').agg({
-                'admissions': 'sum',
-                'lits_dispo': 'sum'  # Somme des lits par service (cohérent)
+                'admissions': 'sum'
             }).reset_index()
-            df_daily_synth.rename(columns={'lits_dispo': 'lits_dispo_total'}, inplace=True)
             
             def calc_dms_ponderee_synth(group):
                 if group['admissions'].sum() > 0:
@@ -526,6 +660,34 @@ with tab1:
             
             # Estimation lits occupés : Application de la Loi de Little
             # Formule : Stock (Lits) = Flux (Admissions/jour) × Durée (DMS)
+            base_lits_occ_synth = (df_daily_synth['admissions'] * df_daily_synth['dms_ponderee']).round(0)
+            
+            def get_variability_synth(date_val):
+                np.random.seed(int(pd.Timestamp(date_val).timestamp()) % 10000)
+                return np.random.normal(1.0, 0.25)
+            
+            df_daily_synth['variability'] = df_daily_synth['date'].apply(get_variability_synth)
+            df_daily_synth['lits_occ_estimes'] = (base_lits_occ_synth * df_daily_synth['variability']).round(0).clip(lower=0)
+            # Utiliser total_lits_global au lieu de la somme des lits_dispo par service
+            df_daily_synth['taux_occ'] = (df_daily_synth['lits_occ_estimes'] / total_lits_synth * 100).clip(0, 85)
+            
+            taux_occupation_actuel_synth = df_daily_synth['taux_occ'].mean() / 100
+        elif 'lits_dispo_global' in df_filtered.columns:
+            # Fallback : utiliser la somme des lits_dispo des services si total_lits_global n'existe pas
+            df_daily_synth = df_filtered.groupby('date').agg({
+                'admissions': 'sum',
+                'lits_dispo': 'sum'  # Somme des lits par service
+            }).reset_index()
+            df_daily_synth.rename(columns={'lits_dispo': 'lits_dispo_total'}, inplace=True)
+            
+            def calc_dms_ponderee_synth(group):
+                if group['admissions'].sum() > 0:
+                    return (group['duree_moy'] * group['admissions']).sum() / group['admissions'].sum()
+                return 0
+            
+            dms_by_date_synth = df_filtered.groupby('date').apply(calc_dms_ponderee_synth)
+            df_daily_synth['dms_ponderee'] = df_daily_synth['date'].map(dms_by_date_synth)
+            
             base_lits_occ_synth = (df_daily_synth['admissions'] * df_daily_synth['dms_ponderee']).round(0)
             
             def get_variability_synth(date_val):
@@ -683,13 +845,15 @@ with tab1:
     
     if len(df_filtered) > 0:
         # Calcul des KPI actuels
-        if 'lits_dispo' in df_filtered.columns:
-            # CORRECTION : Utiliser la somme réelle des lits_dispo des services
+        # CORRECTION : Utiliser total_lits_global (capacité totale depuis le dataset) pour cohérence
+        if 'total_lits_global' in df_filtered.columns:
+            # Utiliser total_lits_global qui est constant (même valeur pour toutes les lignes)
+            # Fallback : valeur par défaut hardcodée si pas de données
+            total_lits_comp = df_filtered['total_lits_global'].iloc[0] if len(df_filtered) > 0 else 1800
+            
             df_daily_comp = df_filtered.groupby('date').agg({
-                'admissions': 'sum',
-                'lits_dispo': 'sum'  # Somme des lits par service (cohérent)
+                'admissions': 'sum'
             }).reset_index()
-            df_daily_comp.rename(columns={'lits_dispo': 'lits_dispo_total'}, inplace=True)
             
             def calc_dms_ponderee_comp(group):
                 if group['admissions'].sum() > 0:
@@ -701,6 +865,34 @@ with tab1:
             
             # Calcul du taux d'occupation : Application de la Loi de Little
             # Formule : Stock (Lits) = Flux (Admissions/jour) × Durée (DMS)
+            base_lits_occ_comp = (df_daily_comp['admissions'] * df_daily_comp['dms_ponderee']).round(0)
+            
+            def get_variability_comp(date_val):
+                np.random.seed(int(pd.Timestamp(date_val).timestamp()) % 10000)
+                return np.random.normal(1.0, 0.25)
+            
+            df_daily_comp['variability'] = df_daily_comp['date'].apply(get_variability_comp)
+            df_daily_comp['lits_occ_estimes'] = (base_lits_occ_comp * df_daily_comp['variability']).round(0).clip(lower=0)
+            # Utiliser total_lits_global au lieu de la somme des lits_dispo par service
+            df_daily_comp['taux_occ'] = (df_daily_comp['lits_occ_estimes'] / total_lits_comp * 100).clip(0, 85)
+            
+            taux_occupation_actuel = df_daily_comp['taux_occ'].mean() / 100
+        elif 'lits_dispo' in df_filtered.columns:
+            # Fallback : utiliser la somme des lits_dispo des services si total_lits_global n'existe pas
+            df_daily_comp = df_filtered.groupby('date').agg({
+                'admissions': 'sum',
+                'lits_dispo': 'sum'  # Somme des lits par service
+            }).reset_index()
+            df_daily_comp.rename(columns={'lits_dispo': 'lits_dispo_total'}, inplace=True)
+            
+            def calc_dms_ponderee_comp(group):
+                if group['admissions'].sum() > 0:
+                    return (group['duree_moy'] * group['admissions']).sum() / group['admissions'].sum()
+                return 0
+            
+            dms_by_date_comp = df_filtered.groupby('date').apply(calc_dms_ponderee_comp)
+            df_daily_comp['dms_ponderee'] = df_daily_comp['date'].map(dms_by_date_comp)
+            
             base_lits_occ_comp = (df_daily_comp['admissions'] * df_daily_comp['dms_ponderee']).round(0)
             
             def get_variability_comp(date_val):
@@ -727,36 +919,64 @@ with tab1:
         # car les urgences sont uniquement dans le service "Urgences"
         # Si on filtre par un autre service, le ratio serait toujours 0
         # On utilise donc les données globales (df) avec les mêmes filtres de date et scénario
-        df_global_for_urgences = df[
-            (df['date'] >= min(df_filtered['date'])) & 
-            (df['date'] <= max(df_filtered['date']))
+        
+        # Récupérer le scénario sélectionné depuis les filtres (plus fiable que depuis df_filtered)
+        # On utilise selected_scenario qui est défini plus haut dans le code
+        date_min = min(df_filtered['date'])
+        date_max = max(df_filtered['date'])
+        
+        # Filtrer par date d'abord
+        df_global_for_ratios = df[
+            (df['date'] >= date_min) &
+            (df['date'] <= date_max)
         ]
-        if 'scenario' in df_filtered.columns and len(df_filtered) > 0:
-            # Appliquer le même filtre de scénario si présent
-            selected_scenario = df_filtered['scenario'].iloc[0] if df_filtered['scenario'].nunique() == 1 else None
-            if selected_scenario and selected_scenario != 'Tous':
-                if selected_scenario == 'normal':
-                    # Pour "normal", utiliser les colonnes _normales
-                    if 'urgences_normales' in df_global_for_urgences.columns:
-                        total_urgences_comp = df_global_for_urgences['urgences_normales'].sum()
-                    else:
-                        total_urgences_comp = df_global_for_urgences[df_global_for_urgences['scenario'] == 'normal']['urgences'].sum()
+        
+        # Appliquer le filtre de scénario de manière cohérente
+        if selected_scenario != 'Tous':
+            if selected_scenario == 'normal':
+                # Pour "normal", utiliser les colonnes _normales pour urgences ET admissions
+                # IMPORTANT : Les colonnes _normales existent pour TOUTES les lignes (même pendant épidémie)
+                # Elles représentent l'activité normale de base, donc on ne filtre PAS par scenario
+                if 'urgences_normales' in df_global_for_ratios.columns and 'admissions_normales' in df_global_for_ratios.columns:
+                    # Utiliser les colonnes _normales sur toutes les lignes (sans filtrer par scenario)
+                    total_urgences_comp = df_global_for_ratios['urgences_normales'].sum()
+                    total_admissions_global = df_global_for_ratios['admissions_normales'].sum()
                 else:
-                    df_global_for_urgences = df_global_for_urgences[df_global_for_urgences['scenario'] == selected_scenario]
-                    total_urgences_comp = df_global_for_urgences['urgences'].sum()
+                    # Fallback si colonnes _normales n'existent pas : filtrer uniquement les lignes où scenario == 'normal'
+                    df_global_for_ratios_normal = df_global_for_ratios[df_global_for_ratios['scenario'] == 'normal']
+                    total_urgences_comp = df_global_for_ratios_normal['urgences'].sum()
+                    total_admissions_global = df_global_for_ratios_normal['admissions'].sum()
             else:
-                total_urgences_comp = df_global_for_urgences['urgences'].sum()
+                # Pour les autres scénarios, filtrer par scenario et utiliser les colonnes totales
+                df_global_for_ratios = df_global_for_ratios[df_global_for_ratios['scenario'] == selected_scenario]
+                total_urgences_comp = df_global_for_ratios['urgences'].sum()
+                total_admissions_global = df_global_for_ratios['admissions'].sum()
         else:
-            total_urgences_comp = df_global_for_urgences['urgences'].sum()
-        
-        # Admissions globales pour le ratio (même période et scénario)
-        total_admissions_global = df_global_for_urgences['admissions'].sum()
+            # Pour "Tous", utiliser les valeurs totales (déjà dans les colonnes admissions/urgences)
+            # Ces colonnes contiennent la somme normale + scénario pour toutes les périodes
+            total_urgences_comp = df_global_for_ratios['urgences'].sum()
+            total_admissions_global = df_global_for_ratios['admissions'].sum()
         ratio_urgences_actuel = total_urgences_comp / total_admissions_global if total_admissions_global > 0 else 0
-        
-        # Calcul du ratio ICU/admissions
-        total_icu_comp = df_filtered['icu'].sum()
-        ratio_icu_actuel = total_icu_comp / total_admissions_comp if total_admissions_comp > 0 else 0
-        
+        # Calcul du ratio ICU/admissions (aussi au niveau global pour cohérence)
+        # IMPORTANT: L'ICU peut être dans plusieurs services, donc on calcule aussi au niveau global
+        # Réutiliser df_global_for_ratios (qui est déjà filtré par date)
+        if selected_scenario != 'Tous':
+            if selected_scenario == 'normal':
+                # Pour "normal", utiliser icu_normales sur toutes les lignes (sans filtrer par scenario)
+                # IMPORTANT : Les colonnes _normales existent pour TOUTES les lignes
+                if 'icu_normales' in df_global_for_ratios.columns:
+                    total_icu_comp = df_global_for_ratios['icu_normales'].sum()
+                else:
+                    # Fallback si colonnes _normales n'existent pas : filtrer uniquement les lignes où scenario == 'normal'
+                    df_global_icu = df_global_for_ratios[df_global_for_ratios['scenario'] == 'normal']
+                    total_icu_comp = df_global_icu['icu'].sum()
+            else:
+                # Pour les autres scénarios, utiliser df_global_for_ratios déjà filtré par scenario
+                total_icu_comp = df_global_for_ratios['icu'].sum()
+        else:
+            # Pour "Tous", utiliser la colonne icu totale (somme normale + scénario)
+            total_icu_comp = df_global_for_ratios['icu'].sum()
+        ratio_icu_actuel = total_icu_comp / total_admissions_global if total_admissions_global > 0 else 0
         # Affichage comparatif
         col_comp1, col_comp2, col_comp3, col_comp4 = st.columns(4)
         
@@ -890,23 +1110,43 @@ with tab1:
         
         # KPI 1: Taux de rotation des lits (nombre de rotations par lit et par an)
         # Formule: (Admissions totales × 365) / (Nombre de jours × Nombre de lits)
-        if 'lits_dispo_global' in df_filtered.columns:
+        # CORRECTION : Utiliser total_lits_global (capacité totale) au lieu de lits_dispo_global (seulement disponibles)
+        if 'total_lits_global' in df_filtered.columns:
             nb_jours_kpi = df_filtered['date'].nunique()
-            lits_dispo_kpi = df_filtered['lits_dispo_global'].iloc[0] if df_filtered['lits_dispo_global'].nunique() == 1 else TOTAL_LITS
-            if nb_jours_kpi > 0 and lits_dispo_kpi > 0:
+            # total_lits_global est constant (même valeur pour toutes les lignes)
+            # Fallback : valeur par défaut hardcodée si pas de données
+            total_lits_kpi = df_filtered['total_lits_global'].iloc[0] if len(df_filtered) > 0 else 1800
+            if nb_jours_kpi > 0 and total_lits_kpi > 0:
                 # Rotation annuelle estimée
-                rotation_annuelle = (total_admissions_kpi * 365) / (nb_jours_kpi * lits_dispo_kpi)
+                rotation_annuelle = (total_admissions_kpi * 365) / (nb_jours_kpi * total_lits_kpi)
+            else:
+                rotation_annuelle = 0
+        elif 'lits_dispo_global' in df_filtered.columns:
+            # Fallback : calculer total_lits_global à partir de lits_occ + lits_dispo_global
+            nb_jours_kpi = df_filtered['date'].nunique()
+            # Prendre la première ligne pour avoir une estimation
+            if len(df_filtered) > 0:
+                sample_lits_occ = df_filtered['lits_occ'].iloc[0] if 'lits_occ' in df_filtered.columns else 0
+                # CORRECTION : Utiliser la moyenne de lits_dispo_global au lieu de vérifier si c'est unique
+                # car les valeurs varient (218, 330, etc.) selon les périodes
+                sample_lits_dispo = df_filtered['lits_dispo_global'].mean() if len(df_filtered) > 0 else 0
+                total_lits_kpi = int(sample_lits_occ + sample_lits_dispo) if (sample_lits_occ + sample_lits_dispo) > 0 else 1800
+            else:
+                # Fallback : valeur par défaut hardcodée
+                total_lits_kpi = 1800
+            if nb_jours_kpi > 0 and total_lits_kpi > 0:
+                rotation_annuelle = (total_admissions_kpi * 365) / (nb_jours_kpi * total_lits_kpi)
             else:
                 rotation_annuelle = 0
         else:
-            # Fallback: utiliser la moyenne des lits disponibles
-            lits_moyen = df_filtered['lits_dispo'].mean() if 'lits_dispo' in df_filtered.columns else TOTAL_LITS
+            # Fallback: utiliser la moyenne des lits disponibles par service
+            # Fallback : valeur par défaut hardcodée si pas de données
+            lits_moyen = df_filtered['lits_dispo'].mean() if 'lits_dispo' in df_filtered.columns else 1800
             nb_jours_kpi = df_filtered['date'].nunique()
             if nb_jours_kpi > 0 and lits_moyen > 0:
                 rotation_annuelle = (total_admissions_kpi * 365) / (nb_jours_kpi * lits_moyen)
             else:
                 rotation_annuelle = 0
-        
         # KPI 2: Taux d'utilisation des lits de réanimation
         # CORRECTION : Calibrage dynamique pour éviter le 120% permanent
         # Au lieu de forcer un nombre de lits fixe (qui peut être inadapté au flux),
@@ -916,20 +1156,32 @@ with tab1:
         if 'lits_dispo' in df_filtered.columns:
             # 1. On calcule le besoin réel selon la Loi de Little
             admissions_icu_jour = total_icu_kpi / max(nb_jours_kpi, 1)
-            dms_icu = SERVICES_DISTRIBUTION.get('Réanimation', {}).get('duree_moy', 7.0)
+            # DATA-DRIVEN : Utiliser la DMS réelle du service Réanimation depuis le CSV
+            df_rea_kpi = df_filtered[df_filtered['service'] == 'Réanimation'] if 'service' in df_filtered.columns else pd.DataFrame()
+            dms_icu = df_rea_kpi['duree_moy'].mean() if len(df_rea_kpi) > 0 and 'duree_moy' in df_rea_kpi.columns else 7.0
             
             # Nombre moyen de patients présents simultanément en Réa
             nb_patients_moyen_rea = admissions_icu_jour * dms_icu
             
-            # 2. On définit la capacité théorique de l'hôpital
-            # Au lieu de forcer "92 lits" (qui est trop bas pour tes données),
-            # on calcule : "Combien de lits faut-il pour absorber ce flux à 85% d'occupation ?"
-            # Cela simule un hôpital correctement dimensionné pour son activité.
-            lits_icu_config = SERVICES_DISTRIBUTION.get('Réanimation', {}).get('lits_base', 92)
-            lits_icu_necessaires = int(nb_patients_moyen_rea / 0.85)  # Objectif 85%
+            # 2. On définit la capacité réelle de l'hôpital (DATA-DRIVEN)
+            # Au lieu d'utiliser la valeur théorique de config.py,
+            # on calcule la capacité réelle observée dans les données historiques
+            # pour le service de Réanimation
+            if 'Réanimation' in df_filtered['service'].values:
+                # Calculer la capacité réelle du service Réanimation depuis le CSV
+                df_rea = df_filtered[df_filtered['service'] == 'Réanimation']
+                moyenne_occupes_rea = df_rea['lits_occ'].mean() if 'lits_occ' in df_rea.columns else 0
+                moyenne_libres_rea = df_rea['lits_dispo'].mean() if 'lits_dispo' in df_rea.columns else 0
+                capacite_reelle_rea = int(moyenne_occupes_rea + moyenne_libres_rea)
+            else:
+                # Fallback si le service Réanimation n'est pas dans les données filtrées
+                capacite_reelle_rea = 0
             
-            # On prend le max entre la config et le nécessaire pour être réaliste
-            lits_icu_estimes = max(lits_icu_config, lits_icu_necessaires)
+            # Calculer combien de lits sont nécessaires pour absorber le flux à 85% d'occupation
+            lits_icu_necessaires = int(nb_patients_moyen_rea / 0.85) if nb_patients_moyen_rea > 0 else 0
+            
+            # On prend le max entre la capacité réelle observée et le nécessaire pour être réaliste
+            lits_icu_estimes = max(capacite_reelle_rea, lits_icu_necessaires) if capacite_reelle_rea > 0 else lits_icu_necessaires
 
             if lits_icu_estimes > 0:
                 # Calcul de l'occupation quotidienne avec variabilité
@@ -1114,6 +1366,187 @@ with tab1:
             showlegend=False
         )
         st.plotly_chart(fig_kpi, use_container_width=True)
+        
+        # ========================================================================
+        # ANALYSE DE LA GRAVITÉ DES PATIENTS (CASEMIX)
+        # ========================================================================
+        if 'gravite' in df_filtered.columns:
+            st.divider()
+            st.markdown("#### Indice de Gravité des Patients (Casemix)")
+            st.caption("Analyse de la complexité des cas traités par service. Une gravité élevée justifie des ratios de personnel et de réanimation plus importants.")
+            
+            # Calcul de la gravité moyenne par service
+            gravite_par_service = df_filtered.groupby('service')['gravite'].agg(['mean', 'count']).reset_index()
+            gravite_par_service.columns = ['service', 'gravite_moyenne', 'nb_patients']
+            gravite_par_service = gravite_par_service.sort_values('gravite_moyenne', ascending=False)
+            
+            # Gravité moyenne globale
+            gravite_globale = df_filtered['gravite'].mean()
+            
+            # Graphique en barres
+            fig_grav = px.bar(
+                gravite_par_service,
+                x='service',
+                y='gravite_moyenne',
+                title="Gravité Moyenne par Service (Échelle 1-5)",
+                color='gravite_moyenne',
+                color_continuous_scale='Reds',
+                text='gravite_moyenne',
+                labels={
+                    'service': 'Service',
+                    'gravite_moyenne': 'Gravité Moyenne',
+                    'nb_patients': 'Nombre de Patients'
+                }
+            )
+            
+            # Ligne de référence "Hôpital Standard" (estimation nationale)
+            fig_grav.add_hline(
+                y=2.5,
+                line_dash="dash",
+                line_color="blue",
+                annotation_text="Moyenne Nationale (Est.)",
+                annotation_position="right"
+            )
+            
+            # Ligne de référence pour la gravité globale de l'hôpital
+            fig_grav.add_hline(
+                y=gravite_globale,
+                line_dash="dot",
+                line_color="green",
+                annotation_text=f"Gravité Globale Hôpital ({gravite_globale:.2f})",
+                annotation_position="left"
+            )
+            
+            fig_grav.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+            fig_grav.update_layout(
+                height=400,
+                yaxis_title="Gravité Moyenne (1 = Faible, 5 = Critique)",
+                xaxis_title="Service",
+                showlegend=False
+            )
+            
+            st.plotly_chart(fig_grav, use_container_width=True)
+            
+            # Métriques de synthèse
+            col_grav1, col_grav2, col_grav3 = st.columns(3)
+            
+            with col_grav1:
+                st.metric(
+                    "Gravité Globale",
+                    f"{gravite_globale:.2f}",
+                    delta=f"vs {2.5:.1f} (National)",
+                    delta_color="normal" if gravite_globale > 2.5 else "inverse",
+                    help="Gravité moyenne de tous les patients sur la période sélectionnée"
+                )
+            
+            with col_grav2:
+                service_max_gravite = gravite_par_service.iloc[0]['service']
+                gravite_max = gravite_par_service.iloc[0]['gravite_moyenne']
+                st.metric(
+                    "Service le Plus Critique",
+                    service_max_gravite,
+                    delta=f"Gravité : {gravite_max:.2f}",
+                    delta_color="off"
+                )
+            
+            with col_grav3:
+                # Pourcentage de patients avec gravité >= 4
+                patients_graves = len(df_filtered[df_filtered['gravite'] >= 4])
+                total_patients = len(df_filtered)
+                pct_graves = (patients_graves / total_patients * 100) if total_patients > 0 else 0
+                st.metric(
+                    "Patients Graves (≥4)",
+                    f"{pct_graves:.1f}%",
+                    delta=f"{patients_graves:,} patients",
+                    delta_color="off"
+                )
+            
+            # Interprétation
+            if gravite_globale > 3.0:
+                st.info(
+                    f"**Analyse** : La gravité moyenne de {gravite_globale:.2f} indique que l'hôpital traite principalement des cas complexes. "
+                    f"Cela justifie les ratios élevés de personnel et de lits de réanimation observés dans les autres KPI."
+                )
+            elif gravite_globale > 2.5:
+                st.info(
+                    f"**Analyse** : La gravité moyenne de {gravite_globale:.2f} est légèrement supérieure à la moyenne nationale. "
+                    f"L'hôpital traite une proportion significative de cas complexes."
+                )
+            else:
+                st.info(
+                    f"**Analyse** : La gravité moyenne de {gravite_globale:.2f} est proche de la moyenne nationale. "
+                    f"L'hôpital traite un mix équilibré de cas de différentes complexités."
+                )
+        
+        # ========================================================================
+        # KPI : AUTONOMIE DES STOCKS (EPI)
+        # ========================================================================
+        if 'Stock_EPI' in df_filtered.columns and 'EPI_Consommation' in df_filtered.columns:
+            st.divider()
+            st.markdown("#### Autonomie des Stocks de Matériel (EPI)")
+            st.caption("Indicateur de gestion logistique : nombre de jours de stock restant basé sur la consommation moyenne")
+            
+            # Calcul de l'autonomie
+            # Utiliser la dernière valeur de stock disponible
+            stock_actuel = df_filtered['Stock_EPI'].iloc[-1] if len(df_filtered) > 0 else 0
+            
+            # Consommation moyenne lissée (moyenne mobile sur 7 jours pour éviter les pics)
+            if len(df_filtered) >= 7:
+                conso_moyenne = df_filtered['EPI_Consommation'].tail(7).mean()
+            else:
+                conso_moyenne = df_filtered['EPI_Consommation'].mean()
+            
+            if conso_moyenne > 0:
+                jours_autonomie = stock_actuel / conso_moyenne
+            else:
+                jours_autonomie = 999  # Stock infini si pas de consommation
+            
+            # Déterminer le statut et la couleur
+            if jours_autonomie < 5:
+                statut = "Rupture imminente"
+                delta_color = "normal"  # Rouge
+            elif jours_autonomie < 7:
+                statut = "Stock critique"
+                delta_color = "off"
+            elif jours_autonomie < 14:
+                statut = "Stock faible"
+                delta_color = "off"
+            else:
+                statut = "Stock sécurisé"
+                delta_color = "inverse"  # Vert
+            
+            col_epi1, col_epi2 = st.columns(2)
+            
+            with col_epi1:
+                st.metric(
+                    "Autonomie Stock Matériel (EPI)",
+                    f"{jours_autonomie:.1f} jours",
+                    delta=statut,
+                    delta_color=delta_color,
+                    help=f"Stock actuel : {stock_actuel:,.0f} unités | Consommation moyenne : {conso_moyenne:.1f} unités/jour"
+                )
+            
+            with col_epi2:
+                # Afficher le stock actuel et la consommation
+                st.metric(
+                    "Stock Actuel",
+                    f"{stock_actuel:,.0f} unités",
+                    delta=f"Consommation moyenne : {conso_moyenne:.1f} unités/jour",
+                    delta_color="off"
+                )
+            
+            # Alerte si rupture imminente
+            if jours_autonomie < 7:
+                st.warning(
+                    f"**Alerte Logistique** : Le stock actuel ({stock_actuel:,.0f} unités) ne couvre que "
+                    f"{jours_autonomie:.1f} jours de consommation. Seuil critique : 7 jours. "
+                    f"Recommandation : Réapprovisionner immédiatement."
+                )
+            elif jours_autonomie < 14:
+                st.info(
+                    f"**Attention** : Le stock actuel couvre {jours_autonomie:.1f} jours. "
+                    f"Seuil recommandé : 14 jours minimum. Planifier un réapprovisionnement prochain."
+                )
         
         # Tableau détaillé des KPI
         st.markdown("#### Détail des KPI")
@@ -1589,11 +2022,6 @@ with tab2:
     #     )
     
     if st.button("Lancer la Simulation", type="primary"):
-            # ========================================================================
-            # SIMULATION TEMPORELLE JOUR PAR JOUR
-            # ========================================================================
-            st.subheader("Résultats de la Simulation Temporelle")
-            
             # Affichage des actions correctives appliquées
             # if renfort_lits > 0 or renfort_personnel > 0:
             #     st.info(f"**Actions correctives appliquées** : "
@@ -1609,6 +2037,7 @@ with tab2:
             use_prophet_beds = os.path.exists('beds_prophet_model.pkl')
             use_prophet_epi = os.path.exists('epi_prophet_model.pkl')
             total_admissions_prophet = None  # Initialisation pour la portée de la variable
+            daily_forecast = None  # Prédictions Prophet pour les admissions (journalières avec intervalles de confiance)
             daily_beds_forecast = None  # Prédictions Prophet pour les lits occupés (journalières)
             daily_epi_forecast = None  # Prédictions Prophet pour la consommation d'EPI (journalières)
             
@@ -1616,7 +2045,6 @@ with tab2:
                 try:
                     # Charger le modèle Prophet
                     prophet_model = joblib.load('admissions_prophet_model.pkl')
-                    st.info("**Prédiction ML** : Utilisation du modèle Prophet pour projeter la tendance normale avant application des scénarios.")
                     
                     # Préparer les données pour Prophet (agrégation horaire)
                     # On charge les données horaires depuis hospital_synth.csv si disponible
@@ -1626,9 +2054,7 @@ with tab2:
                             'Nombre_Admissions': 'sum',
                             'Indicateur_Epidemie': 'max',
                             'Indicateur_Canicule': 'max',
-                            'Indicateur_Greve': 'max',
-                            'gravite': 'mean',
-                            'duree_sejour_estimee': 'mean'
+                            'Indicateur_Greve': 'max'
                         }).reset_index()
                         
                         # Créer un DataFrame pour les prédictions futures
@@ -1656,10 +2082,14 @@ with tab2:
                         # Prédire avec Prophet
                         forecast = prophet_model.predict(future_df)
                         
-                        # Agréger les prédictions horaires en journalières
+                        # Agréger les prédictions horaires en journalières (avec intervalles de confiance)
                         forecast['date'] = forecast['ds'].dt.date
-                        daily_forecast = forecast.groupby('date')['yhat'].sum().reset_index()
-                        daily_forecast.columns = ['date', 'admissions_totales']
+                        daily_forecast = forecast.groupby('date').agg({
+                            'yhat': 'sum',
+                            'yhat_upper': 'sum',  # Borne supérieure
+                            'yhat_lower': 'sum'   # Borne inférieure
+                        }).reset_index()
+                        daily_forecast.columns = ['date', 'admissions_totales', 'admissions_upper', 'admissions_lower']
                         
                         # Utiliser les prédictions Prophet comme base
                         # Répartir les admissions totales par service selon les poids
@@ -1689,12 +2119,14 @@ with tab2:
                                 # Prédire les lits occupés horaires
                                 forecast_beds = prophet_beds_model.predict(future_df_beds)
                                 
-                                # Agréger les prédictions horaires en journalières
+                                # Agréger les prédictions horaires en journalières (avec intervalles de confiance)
                                 forecast_beds['date'] = forecast_beds['ds'].dt.date
-                                daily_beds_forecast = forecast_beds.groupby('date')['yhat'].mean().reset_index()
-                                daily_beds_forecast.columns = ['date', 'lits_occ_prophet']
-                                
-                                st.info("**Prédiction ML** : Utilisation du modèle Prophet pour projeter la tendance normale (admissions ET lits occupés) avant application des scénarios.")
+                                daily_beds_forecast = forecast_beds.groupby('date').agg({
+                                    'yhat': 'mean',
+                                    'yhat_upper': 'mean',  # Borne supérieure
+                                    'yhat_lower': 'mean'   # Borne inférieure
+                                }).reset_index()
+                                daily_beds_forecast.columns = ['date', 'lits_occ_prophet', 'lits_occ_upper', 'lits_occ_lower']
                                 
                             except Exception as e:
                                 st.warning(f"Erreur lors du chargement du modèle Prophet pour les lits occupés: {e}. Utilisation de la Loi de Little en fallback.")
@@ -1743,8 +2175,6 @@ with tab2:
                                 daily_epi_forecast = forecast_epi.groupby('date')['yhat'].sum().reset_index()
                                 daily_epi_forecast.columns = ['date', 'epi_consommation_prophet']
                                 
-                                st.info("**Prédiction ML** : Utilisation du modèle Prophet pour projeter la tendance normale (admissions, lits occupés ET consommation d'EPI) avant application des scénarios.")
-                                
                             except Exception as e:
                                 st.warning(f"Erreur lors du chargement du modèle Prophet pour la consommation d'EPI: {e}. Utilisation d'une estimation basique en fallback.")
                                 use_prophet_epi = False
@@ -1767,6 +2197,27 @@ with tab2:
             # Données historiques en conditions normales pour l'entraînement
             base_period = df[df['scenario'] == 'normal']
             
+            # DATA-DRIVEN : Calculer les poids (weight) depuis le CSV
+            # Au lieu d'utiliser config.py, on calcule la proportion réelle d'admissions par service
+            total_admissions_base = base_period['admissions'].sum()
+            service_weights = {}
+            if total_admissions_base > 0:
+                for svc in df['service'].unique():
+                    svc_admissions = base_period[base_period['service'] == svc]['admissions'].sum()
+                    service_weights[svc] = svc_admissions / total_admissions_base
+                
+                # Vérification : la somme des poids doit être proche de 1.0
+                sum_weights = sum(service_weights.values())
+                if abs(sum_weights - 1.0) > 0.01:  # Tolérance de 1%
+                    # Normaliser si nécessaire
+                    for svc in service_weights:
+                        service_weights[svc] = service_weights[svc] / sum_weights
+            else:
+                # Fallback : répartition égale si pas de données
+                n_services = len(df['service'].unique())
+                for svc in df['service'].unique():
+                    service_weights[svc] = 1.0 / n_services if n_services > 0 else 0.1
+            
             # Calcul des valeurs de base par service avec PRÉDICTION ML
             base_values = {}
             
@@ -1776,9 +2227,10 @@ with tab2:
                 if len(service_data) > 0:
                     # --- 1. PRÉDICTION DES FLUX (Prophet ou LinearRegression) ---
                     if use_prophet and total_admissions_prophet is not None:
-                        # Utiliser les prédictions Prophet et répartir par service
-                        service_weight = SERVICES_DISTRIBUTION.get(service, {}).get('weight', 0.1)
+                        # DATA-DRIVEN : Utiliser le poids calculé depuis le CSV au lieu de config.py
+                        service_weight = service_weights.get(service, 0.1)
                         admissions_base = total_admissions_prophet * service_weight
+                        # Note : Les intervalles de confiance pour les admissions seront stockés dans la boucle de simulation
                         
                         # Pour urgences et ICU, utiliser les ratios moyens du service
                         avg_urgences = service_data['urgences'].mean() if 'urgences' in service_data.columns else 0
@@ -1844,45 +2296,116 @@ with tab2:
                         else:
                             icu_base = avg_icu
                     
-                    # --- 2. CALIBRAGE INTELLIGENT DE LA CAPACITÉ (C'est ici que ça se joue) ---
-                    service_config = SERVICES_DISTRIBUTION.get(service, {})
-                    dms_service = service_config.get('duree_moy', 5.0)
+                    # --- 2. INITIALISATION DATA-DRIVEN (Adieu Config.py) ---
+                    # Au lieu de lire la capacité théorique du fichier de config (souvent fausse),
+                    # on calcule la capacité RÉELLE constatée dans les données historiques.
                     
-                    # CORRECTION CRITIQUE : On calibre sur admissions_base (la valeur qui sera utilisée en simulation)
-                    # et non sur avg_admissions, sinon il y a un décalage entre le calibrage et la simulation
-                    # Calcul de la charge structurelle (Loi de Little) : Combien de patients j'aurai avec admissions_base ?
-                    charge_patients_base = admissions_base * dms_service
+                    # DATA-DRIVEN : Utiliser la DMS réelle depuis le CSV au lieu de config.py
+                    dms_service = service_data['duree_moy'].mean() if 'duree_moy' in service_data.columns and len(service_data) > 0 else 5.0
                     
-                    # CORRECTION MAJEURE : Dimensionnement des lits pour viser 70% d'occupation MOYENNE en temps normal
-                    # Pourquoi 70% et non 85% ? Parce qu'avec la variabilité stochastique (±5% sur lits + ±2% scénario),
-                    # si on calibre à 85%, on dépasse 85% la moitié du temps (18 jours sur 30).
-                    # En calibrant à 70%, on a une marge de sécurité : moyenne à 70%, pics à 85%, rarement au-delà
-                    # Si j'ai 100 patients, il me faut 143 lits pour être à 70% (100 / 0.70)
-                    lits_necessaires_target = int(charge_patients_base / 0.70)
+                    # DATA-DRIVEN : Utiliser directement la capacité moyenne observée dans le CSV
+                    # Note : 'lits_dispo' dans le DataFrame représente déjà la capacité totale du service
+                    # (répartie proportionnellement dans load_and_adapt_data())
+                    # On utilise la moyenne des lits_dispo observés comme capacité de départ
+                    lits_dispo_start = int(service_data['lits_dispo'].mean()) if len(service_data) > 0 else 100
                     
-                    # On prend le MAX entre la config et le besoin réel pour ne jamais être en sous-capacité au démarrage
-                    lits_dispo_start = max(service_config.get('lits_base', 0), lits_necessaires_target)
+                    # Vérification de cohérence : si la capacité calculée est trop faible par rapport aux lits occupés moyens,
+                    # on ajuste pour avoir un taux d'occupation réaliste (70-85% en normal)
+                    moyenne_occupes = service_data['lits_occ'].mean()
+                    if lits_dispo_start < moyenne_occupes * 1.2:  # Si capacité < 120% des lits occupés moyens
+                        # Ajuster pour avoir un taux d'occupation réaliste (~75% en moyenne)
+                        lits_dispo_start = max(int(moyenne_occupes / 0.75), lits_dispo_start)
                     
-                    # CORRECTION CRITIQUE : Dimensionnement du personnel basé sur le besoin réel, pas sur les lits
-                    # Ratio : 1 ETP pour 3 patients (lits occupés)
-                    # Pour 70% d'occupation MOYENNE : personnel_requis = (lits_dispo * 0.70) / 3 = lits_dispo * 0.233
-                    # On ajoute 20% de marge pour les roulements, congés, etc. : 0.233 * 1.2 = 0.28
-                    # Mais on garde un minimum de 0.40 pour être réaliste
-                    personnel_requis_calibre = (lits_dispo_start * 0.70) / 3  # Besoin à 70% d'occupation moyenne
-                    personnel_dispo_start = max(personnel_requis_calibre * 1.2, lits_dispo_start * 0.40)  # Marge de 20% + minimum
+                    # Personnel : On aligne aussi sur la réalité du CSV
+                    # On regarde combien de personnel il y avait en moyenne pour cette capacité
+                    if 'personnel_disponible' in service_data.columns:
+                        personnel_dispo_start = service_data['personnel_disponible'].mean()
+                    else:
+                        # Fallback si colonne absente : Ratio réaliste de 0.5 ETP / Lit total
+                        personnel_dispo_start = lits_dispo_start * 0.50
 
-                    # Stockage des valeurs de base calibrées
+                    # Stockage des valeurs de base
                     base_values[service] = {
-                        'admissions': admissions_base,  # Valeur prédite par ML ou moyenne
-                        'urgences': urgences_base,      # Valeur prédite par ML ou moyenne
-                        'icu': icu_base,                # Valeur prédite par ML ou moyenne
-                        'duree_moy': dms_service,
-                        'lits_dispo': lits_dispo_start,       # VALEUR CORRIGÉE : capacité calibrée sur admissions_base
-                        'personnel_disponible': personnel_dispo_start  # VALEUR CORRIGÉE : personnel aligné sur besoin réel
+                        'admissions': admissions_base,
+                        'urgences': urgences_base,
+                        'icu': icu_base,
+                        'duree_moy': dms_service,  # DATA-DRIVEN : DMS moyenne calculée depuis le CSV
+                        'lits_dispo': lits_dispo_start,       # <--- Vient du CSV
+                        'personnel_disponible': personnel_dispo_start  # <--- Vient du CSV
                     }
             
-            # Multiplicateurs du scénario
-            mult = SCENARIO_MULTIPLIERS[sim_scenario]
+            # DATA-DRIVEN : Calculer les multiplicateurs de scénario depuis le CSV
+            # Au lieu d'utiliser config.py, on compare les périodes normales vs les périodes de scénarios
+            def calculate_scenario_multipliers(scenario_name):
+                """Calcule les multiplicateurs d'un scénario en comparant avec la période normale"""
+                if scenario_name == 'normal':
+                    return {
+                        'admissions': 1.0,
+                        'urgences': 1.0,
+                        'icu': 1.0,
+                        'personnel': 1.0,
+                        'materiel': 1.0,
+                        'dms': 1.0
+                    }
+                
+                # Comparer les moyennes des périodes normales vs scénarios
+                df_normal = df[df['scenario'] == 'normal']
+                df_scenario = df[df['scenario'] == scenario_name]
+                
+                if len(df_normal) == 0 or len(df_scenario) == 0:
+                    # Fallback : valeurs par défaut hardcodées si pas de données dans le CSV
+                    default_multipliers = {
+                        'normal': {'admissions': 1.0, 'urgences': 1.0, 'icu': 1.0, 'personnel': 1.0, 'materiel': 1.0, 'dms': 1.0},
+                        'epidemie': {'admissions': 1.4, 'urgences': 1.6, 'icu': 2.0, 'personnel': 1.3, 'materiel': 1.8, 'dms': 2.0},
+                        'canicule': {'admissions': 1.2, 'urgences': 1.4, 'icu': 1.3, 'personnel': 1.1, 'materiel': 1.2, 'dms': 1.1},
+                        'greve': {'admissions': 0.9, 'urgences': 1.1, 'icu': 1.0, 'personnel': 0.6, 'materiel': 1.0, 'dms': 1.0},
+                        'accident': {'admissions': 1.8, 'urgences': 2.5, 'icu': 2.2, 'personnel': 1.5, 'materiel': 2.0, 'dms': 1.5}
+                    }
+                    return default_multipliers.get(scenario_name, default_multipliers['normal'])
+                
+                # Calculer les ratios moyens
+                avg_admissions_normal = df_normal['admissions'].mean()
+                avg_admissions_scenario = df_scenario['admissions'].mean()
+                mult_admissions = avg_admissions_scenario / avg_admissions_normal if avg_admissions_normal > 0 else 1.0
+                
+                avg_urgences_normal = df_normal['urgences'].mean() if 'urgences' in df_normal.columns else 0
+                avg_urgences_scenario = df_scenario['urgences'].mean() if 'urgences' in df_scenario.columns else 0
+                mult_urgences = avg_urgences_scenario / avg_urgences_normal if avg_urgences_normal > 0 else 1.0
+                
+                avg_icu_normal = df_normal['icu'].mean() if 'icu' in df_normal.columns else 0
+                avg_icu_scenario = df_scenario['icu'].mean() if 'icu' in df_scenario.columns else 0
+                mult_icu = avg_icu_scenario / avg_icu_normal if avg_icu_normal > 0 else 1.0
+                
+                # Pour le personnel, on utilise la moyenne si disponible
+                avg_personnel_normal = df_normal['personnel_disponible'].mean() if 'personnel_disponible' in df_normal.columns else 0
+                avg_personnel_scenario = df_scenario['personnel_disponible'].mean() if 'personnel_disponible' in df_scenario.columns else 0
+                mult_personnel = avg_personnel_scenario / avg_personnel_normal if avg_personnel_normal > 0 else 1.0
+                
+                # Pour le matériel, calculer depuis le CSV si disponible, sinon estimation
+                if 'materiel_medicaments' in df_normal.columns and 'materiel_medicaments' in df_scenario.columns:
+                    avg_materiel_normal = df_normal['materiel_medicaments'].mean()
+                    avg_materiel_scenario = df_scenario['materiel_medicaments'].mean()
+                    mult_materiel = avg_materiel_scenario / avg_materiel_normal if avg_materiel_normal > 0 else 1.0
+                else:
+                    # Fallback : estimation via les admissions (ratio approximatif)
+                    mult_materiel = mult_admissions * 1.2  # Matériel suit généralement les admissions avec un léger surplus
+                
+                # Pour la DMS, comparer les durées moyennes
+                avg_dms_normal = df_normal['duree_moy'].mean() if 'duree_moy' in df_normal.columns else 5.0
+                avg_dms_scenario = df_scenario['duree_moy'].mean() if 'duree_moy' in df_scenario.columns else avg_dms_normal
+                mult_dms = avg_dms_scenario / avg_dms_normal if avg_dms_normal > 0 else 1.0
+                
+                return {
+                    'admissions': max(0.1, min(3.0, mult_admissions)),  # Limiter entre 0.1 et 3.0 pour réalisme
+                    'urgences': max(0.1, min(3.0, mult_urgences)),
+                    'icu': max(0.1, min(3.0, mult_icu)),
+                    'personnel': max(0.1, min(2.0, mult_personnel)),
+                    'materiel': max(0.1, min(3.0, mult_materiel)),
+                    'dms': max(0.5, min(2.5, mult_dms))
+                }
+            
+            # Calculer les multiplicateurs pour le scénario sélectionné
+            mult = calculate_scenario_multipliers(sim_scenario)
             
             # Fonction pour calculer la courbe d'évolution du scénario
             # Les scénarios ont une montée progressive, un pic, puis une descente
@@ -1949,7 +2472,12 @@ with tab2:
                     'deficit_personnel': 0,
                     'materiel_respirateurs': 0,
                     'materiel_medicaments': 0,
-                    'materiel_protection': 0  # Consommation d'EPI
+                    'materiel_protection': 0,  # Consommation d'EPI
+                    # Intervalles de confiance Prophet (si disponibles)
+                    'admissions_upper': None,
+                    'admissions_lower': None,
+                    'lits_occ_upper': None,
+                    'lits_occ_lower': None
                 }
                 
                 for service in df['service'].unique():
@@ -1960,6 +2488,19 @@ with tab2:
                         admissions_jour = base['admissions'] * mult['admissions'] * evolution_factor
                         urgences_jour = base['urgences'] * mult['urgences'] * evolution_factor
                         icu_jour = base['icu'] * mult['icu'] * evolution_factor
+                        
+                        # Stocker les intervalles de confiance pour les admissions (si Prophet est utilisé)
+                        if use_prophet and 'daily_forecast' in locals() and daily_forecast is not None and 'admissions_upper' in daily_forecast.columns:
+                            current_date_date = current_date.date()
+                            if current_date_date in daily_forecast['date'].values:
+                                row_forecast = daily_forecast[daily_forecast['date'] == current_date_date].iloc[0]
+                                service_weight = service_weights.get(service, 0.1)
+                                if day_total['admissions_upper'] is None:
+                                    day_total['admissions_upper'] = 0
+                                if day_total['admissions_lower'] is None:
+                                    day_total['admissions_lower'] = 0
+                                day_total['admissions_upper'] += row_forecast['admissions_upper'] * service_weight * mult['admissions'] * evolution_factor
+                                day_total['admissions_lower'] += row_forecast['admissions_lower'] * service_weight * mult['admissions'] * evolution_factor
                         
                         # DMS ajustée selon scénario
                         dms_ajustee = base['duree_moy'] * mult['dms']
@@ -1972,15 +2513,25 @@ with tab2:
                             # On répartit les lits occupés globaux par service selon les poids
                             current_date_date = current_date.date()
                             
-                            # Trouver la prédiction Prophet pour ce jour
+                            # Trouver la prédiction Prophet pour ce jour (avec intervalles de confiance)
                             if current_date_date in daily_beds_forecast['date'].values:
-                                lits_occ_global_prophet = daily_beds_forecast[daily_beds_forecast['date'] == current_date_date]['lits_occ_prophet'].iloc[0]
+                                row_beds = daily_beds_forecast[daily_beds_forecast['date'] == current_date_date].iloc[0]
+                                lits_occ_global_prophet = row_beds['lits_occ_prophet']
+                                # Stocker les intervalles de confiance (si disponibles)
+                                if 'lits_occ_upper' in row_beds and pd.notna(row_beds['lits_occ_upper']):
+                                    if day_total['lits_occ_upper'] is None:
+                                        day_total['lits_occ_upper'] = 0
+                                    day_total['lits_occ_upper'] += row_beds['lits_occ_upper'] * service_weight * mult['admissions'] * evolution_factor
+                                if 'lits_occ_lower' in row_beds and pd.notna(row_beds['lits_occ_lower']):
+                                    if day_total['lits_occ_lower'] is None:
+                                        day_total['lits_occ_lower'] = 0
+                                    day_total['lits_occ_lower'] += row_beds['lits_occ_lower'] * service_weight * mult['admissions'] * evolution_factor
                             else:
                                 # Si la date n'est pas dans les prédictions, utiliser la moyenne
                                 lits_occ_global_prophet = daily_beds_forecast['lits_occ_prophet'].mean()
                             
-                            # Répartir les lits occupés globaux par service selon les poids
-                            service_weight = SERVICES_DISTRIBUTION.get(service, {}).get('weight', 0.1)
+                            # DATA-DRIVEN : Répartir les lits occupés globaux par service selon les poids calculés depuis le CSV
+                            service_weight = service_weights.get(service, 0.1)
                             base_lits_occ = lits_occ_global_prophet * service_weight
                             
                             # Appliquer les multiplicateurs de scénario et le facteur d'évolution
@@ -2060,7 +2611,9 @@ with tab2:
                     lits_rea_totaux = day_total['lits_rea_occ']
                 else:
                     # Sinon, on estime via Loi de Little : patients en réa = admissions réa/jour * DMS réa
-                    dms_rea = SERVICES_DISTRIBUTION.get('Réanimation', {}).get('duree_moy', 7.0)
+                    # DATA-DRIVEN : Utiliser la DMS réelle du service Réanimation depuis le CSV
+                    df_rea_sim = base_period[base_period['service'] == 'Réanimation'] if 'service' in base_period.columns else pd.DataFrame()
+                    dms_rea = df_rea_sim['duree_moy'].mean() if len(df_rea_sim) > 0 and 'duree_moy' in df_rea_sim.columns else 7.0
                     total_icu_jour = day_total['icu']  # Total des admissions en réa ce jour (tous services confondus)
                     lits_rea_totaux = total_icu_jour * dms_rea
                 
@@ -2131,59 +2684,6 @@ with tab2:
                 simulation_days.append(day_total)
             
             df_simulation = pd.DataFrame(simulation_days)
-            
-            # # ========================================================================
-            # # IMPACT DES ACTIONS CORRECTIVES
-            # # ========================================================================
-            # if renfort_lits > 0 or renfort_personnel > 0:
-            #     st.divider()
-            #     st.subheader("Impact des Actions Correctives")
-                
-            #     # Calculer l'impact moyen
-            #     taux_occ_moyen = df_simulation['taux_occupation'].mean()
-            #     deficit_personnel_moyen = df_simulation['deficit_personnel'].mean()
-            #     lits_dispo_total = df_simulation['lits_dispo'].iloc[0] if len(df_simulation) > 0 else 0
-            #     personnel_dispo_total = df_simulation['personnel_disponible'].iloc[0] if len(df_simulation) > 0 else 0
-                
-            #     col_impact1, col_impact2 = st.columns(2)
-                
-            #     with col_impact1:
-            #         st.metric(
-            #             "Taux d'Occupation Moyen",
-            #             f"{taux_occ_moyen:.1f}%",
-            #             help=f"Avec {renfort_lits} lits supplémentaires ajoutés"
-            #         )
-            #         if renfort_lits > 0:
-            #             st.metric(
-            #                 "Lits Disponibles Totaux",
-            #                 f"{lits_dispo_total:.0f} lits",
-            #                 delta=f"+{renfort_lits:.0f} lits",
-            #                 delta_color="normal"
-            #             )
-            #         else:
-            #             st.metric(
-            #                 "Lits Disponibles Totaux",
-            #                 f"{lits_dispo_total:.0f} lits"
-            #             )
-                
-            #     with col_impact2:
-            #         st.metric(
-            #             "Déficit Personnel Moyen",
-            #             f"{deficit_personnel_moyen:.1f}%",
-            #             help=f"Avec {renfort_personnel} équivalents temps plein de renfort"
-            #         )
-            #         if renfort_personnel > 0:
-            #             st.metric(
-            #                 "Personnel Disponible Total",
-            #                 f"{personnel_dispo_total:.1f} équivalents temps plein",
-            #                 delta=f"+{renfort_personnel:.0f} équivalents temps plein",
-            #                 delta_color="normal"
-            #             )
-            #         else:
-            #             st.metric(
-            #                 "Personnel Disponible Total",
-            #                 f"{personnel_dispo_total:.1f} équivalents temps plein"
-            #             )
             
             # ========================================================================
             # IDENTIFICATION DES PICS ET JOURS CRITIQUES
@@ -2257,21 +2757,53 @@ with tab2:
             # Graphique 1: Évolution des admissions et lits
             fig_evolution = go.Figure()
             
+            # Ajouter les zones d'incertitude (intervalles de confiance Prophet) si disponibles
+            if 'admissions_upper' in df_simulation.columns and df_simulation['admissions_upper'].notna().any():
+                # Zone d'incertitude pour les admissions
+                fig_evolution.add_trace(go.Scatter(
+                    x=pd.concat([df_simulation['date'], df_simulation['date'][::-1]]),
+                    y=pd.concat([df_simulation['admissions_upper'], df_simulation['admissions_lower'][::-1]]),
+                    fill='toself',
+                    fillcolor='rgba(31, 119, 180, 0.2)',  # Bleu transparent
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=True,
+                    name='Intervalle de Confiance Admissions (95%)',
+                    legendgroup='admissions'
+                ))
+            
             fig_evolution.add_trace(go.Scatter(
                 x=df_simulation['date'],
                 y=df_simulation['admissions'],
                 mode='lines+markers',
-                name='Admissions',
-                line=dict(color='#1f77b4', width=2)
+                name='Admissions (Prédiction)',
+                line=dict(color='#1f77b4', width=2),
+                legendgroup='admissions'
             ))
+            
+            # Zone d'incertitude pour les lits occupés si disponible
+            if 'lits_occ_upper' in df_simulation.columns and df_simulation['lits_occ_upper'].notna().any():
+                fig_evolution.add_trace(go.Scatter(
+                    x=pd.concat([df_simulation['date'], df_simulation['date'][::-1]]),
+                    y=pd.concat([df_simulation['lits_occ_upper'], df_simulation['lits_occ_lower'][::-1]]),
+                    fill='toself',
+                    fillcolor='rgba(255, 127, 14, 0.2)',  # Orange transparent
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=True,
+                    name='Intervalle de Confiance Lits (95%)',
+                    yaxis='y2',
+                    legendgroup='lits'
+                ))
             
             fig_evolution.add_trace(go.Scatter(
                 x=df_simulation['date'],
                 y=df_simulation['lits_occ'],
                 mode='lines+markers',
-                name='Lits Occupés',
+                name='Lits Occupés (Prédiction)',
                 yaxis='y2',
-                line=dict(color='#ff7f0e', width=2)
+                line=dict(color='#ff7f0e', width=2),
+                legendgroup='lits'
             ))
             
             # # Ajouter une trace pour les lits disponibles (pour voir l'impact du renfort)
